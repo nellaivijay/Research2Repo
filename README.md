@@ -24,3 +24,13 @@ Traditional "Paper-to-Code" implementations rely on chunking and Retrieval-Augme
 git clone [https://github.com/your-org/Research2Repo.git](https://github.com/your-org/Research2Repo.git)
 cd Research2Repo
 pip install -r requirements.txt
+
+Set your Google API Key:
+```bash
+export GEMINI_API_KEY="your_api_key_here"
+
+
+## 💻 Usage
+```bash
+python main.py --pdf_url "[https://arxiv.org/pdf/1706.03762.pdf](https://arxiv.org/pdf/1706.03762.pdf)" --output_dir "./examples/attention_is_all_you_need"
+
