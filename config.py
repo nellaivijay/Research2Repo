@@ -36,6 +36,21 @@ class R2RConfig:
     diagram_dpi: int = 150
     vision_batch_size: int = 4
 
+    # CodeRAG settings
+    enable_code_rag: bool = False
+    code_rag_max_repos: int = 3
+    code_rag_max_files: int = 20
+
+    # Document segmentation settings
+    enable_segmentation: bool = True  # auto-enabled when paper exceeds token limit
+    segmentation_max_chars: int = 12000
+    segmentation_overlap: int = 500
+
+    # Context management settings
+    enable_context_manager: bool = True
+    context_max_chars: int = 80000
+    context_use_llm_summaries: bool = True
+
     # Cache settings
     cache_dir: str = ".r2r_cache"
 

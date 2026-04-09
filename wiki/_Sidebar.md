@@ -17,6 +17,7 @@
 - [Provider System & Configuration](Provider-System-and-Configuration)
 - [Pipeline Stages Deep Dive](Pipeline-Stages-Deep-Dive)
 - [Prompt Engineering Guide](Prompt-Engineering-Guide)
+- [Advanced Features v3.1](Advanced-Features-v3.1)
 
 ### Operations
 

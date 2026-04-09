@@ -8,6 +8,14 @@ Supports **Google Gemini**, **OpenAI GPT-4o/o3**, **Anthropic Claude**, and **Ol
 
 ---
 
+## What's New in v3.1 (DeepCode-Inspired)
+
+| Feature | Description |
+|---------|-------------|
+| **CodeRAG** | Mine GitHub for reference implementations; LLM-scored file-to-file relevance mappings with confidence scores |
+| **Document Segmentation** | Content-aware paper chunking for papers exceeding token limits; preserves algorithm blocks and equation chains |
+| **Context Manager** | Clean-slate context with cumulative code summaries — prevents context overflow during multi-file generation |
+
 ## What's New in v3.0
 
 | Feature | Description |
@@ -36,22 +44,31 @@ PDF --> [Analyzer] --> [Equation Extractor] --> [Architect] --> [Coder] --> [Val
       + Multimodal         Extraction           JSON Output    Context       + Auto-Fix
 ```
 
-### Agent Mode (v3.0)
+### Agent Mode (v3.0 + v3.1)
 
 ```
-PDF --> [Paper Parser] --> [Decomposed Planner] --> [Per-File Analyzer] --> [Coder] --> [Validator]
-           |                    |                        |                    |             |
-       Multi-backend     4-stage decomposed        Deep per-file         Rolling       Auto-Fix
-       (GROBID/PyMuPDF)  + UML diagrams            specification        Context       Loop
-                                |                        |                    |
-                         [Self-Refine]             [Self-Refine]              |
-                                                                             v
+PDF --> [Paper Parser] --> [Decomposed Planner] --> [Per-File Analyzer] --> [Doc Segmenter]
+           |                    |                        |                       |
+       Multi-backend     4-stage decomposed        Deep per-file          Auto-segments
+       (GROBID/PyMuPDF)  + UML diagrams            specification         large papers
+                                |                        |                       |
+                         [Self-Refine]             [Self-Refine]          [CodeRAG (opt)]
+                                                                              |
+                                                                    GitHub ref mining
+                                                                              |
+                                                                    [Context-Managed Coder]
+                                                                              |
+                                                                    Clean-slate context
+                                                                    + cumulative summaries
+                                                                              |
+                                                                       [Validator]
+                                                                              |
                                                                     [Execution Sandbox]
-                                                                             |
+                                                                              |
                                                                     [Auto-Debugger]
-                                                                             |
+                                                                              |
                                                                     [DevOps Generator]
-                                                                             |
+                                                                              |
                                                                     [Evaluator] --> Repository
 ```
 
@@ -62,7 +79,9 @@ PDF --> [Paper Parser] --> [Decomposed Planner] --> [Per-File Analyzer] --> [Cod
 | 1 | `PaperAnalyzer` | Long-context analysis + vision diagram extraction |
 | 2 | `DecomposedPlanner` | 4-stage planning: overall -> architecture (UML) -> logic -> config |
 | 3 | `FileAnalyzer` | Per-file deep analysis with accumulated context |
-| 4 | `CodeSynthesizer` | File-by-file code generation with rolling dependency context |
+| 3b | `DocumentSegmenter` | Semantic segmentation for papers exceeding token limits (v3.1) |
+| 3c | `CodeRAG` | Mine GitHub for reference implementations with confidence-scored mappings (v3.1) |
+| 4 | `CodeSynthesizer` + `ContextManager` | File-by-file generation with clean-slate context + cumulative summaries (v3.1) |
 | 5 | `TestGenerator` | Auto-generated pytest suite |
 | 6 | `CodeValidator` | Self-review + iterative auto-fix loop |
 | 7 | `ExecutionSandbox` + `AutoDebugger` | Run code in Docker/local sandbox, auto-debug failures |
@@ -177,6 +196,16 @@ python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent --i
 python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent \
   --refine --execute --evaluate --reference-dir ./reference_impl
 
+# Enable CodeRAG: mine GitHub for reference code (v3.1)
+python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent --code-rag
+
+# Full v3.1 pipeline with CodeRAG + all features
+python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent \
+  --code-rag --refine --execute
+
+# Disable context manager (use legacy rolling-window context)
+python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent --no-context-manager
+
 # Evaluate against reference implementation
 python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent \
   --evaluate --reference-dir ./path/to/reference/repo
@@ -228,6 +257,9 @@ Research2Repo/
     debugger.py                    # AutoDebugger — iterative error fixing (v3.0)
     evaluator.py                   # ReferenceEvaluator — scoring (v3.0)
     devops.py                      # DevOpsGenerator — Dockerfile, CI, Makefile (v3.0)
+    code_rag.py                    # CodeRAG — GitHub reference mining + indexing (v3.1)
+    document_segmenter.py          # DocumentSegmenter — semantic paper chunking (v3.1)
+    context_manager.py             # ContextManager — clean-slate context + summaries (v3.1)
 
   agents/                          # Multi-agent architecture (v3.0)
     __init__.py
@@ -320,6 +352,46 @@ Files are generated in dependency order (config -> utils -> model components -> 
 - Per-file analysis results
 - Mermaid diagrams
 
+### 6b. Context Manager (v3.1) — Clean-Slate Generation
+
+The v3.1 ContextManager replaces the rolling-window approach with a "clean-slate" strategy inspired by DeepCode's memory agent:
+
+1. **After each file**, a compact summary is generated (classes, functions, key algorithms)
+2. **Before each new file**, the context is rebuilt from scratch:
+   - Architecture plan (always)
+   - Cumulative code summary (compressed representation of all prior files)
+   - Full source of direct dependencies only
+   - Reference code from CodeRAG (if enabled)
+   - File-specific generation instructions
+3. This prevents context overflow when generating 20+ files while maintaining cross-file coherence.
+
+### 6c. CodeRAG (v3.1) — Reference Code Mining
+
+When `--code-rag` is enabled, the pipeline:
+
+1. **Generates search queries** from the paper (title, key components, algorithms)
+2. **Searches GitHub** for relevant reference implementations (sorted by stars)
+3. **Downloads and indexes** source files from top repositories
+4. **Scores relevance** using the LLM: each reference file is mapped to target files with confidence scores:
+   - `direct_match` (1.0): implements the same component
+   - `partial_match` (0.8): related component
+   - `reference` (0.6): useful architectural pattern
+   - `utility` (0.4): adaptable helper code
+5. During code generation, relevant reference snippets are injected as context.
+
+### 6d. Document Segmentation (v3.1) — Large Paper Support
+
+Papers exceeding token limits are automatically segmented using content-aware strategies:
+
+- **Algorithm preservation**: Algorithm blocks are never split mid-procedure
+- **Equation chain grouping**: Related equations stay together
+- **Section-aware splitting**: Respects logical section boundaries with overlap
+- **4 strategies** selected automatically based on document characteristics:
+  - `semantic_research_focused`: Default for standard papers
+  - `algorithm_preserve_integrity`: For algorithm-heavy papers
+  - `concept_implementation_hybrid`: For papers with both algorithms and heavy math
+  - `content_aware_segmentation`: For ML/DL-specific papers
+
 ### 7. Self-Review Validation Loop
 
 After generation, a separate validation pass compares every generated file against the paper:
@@ -379,6 +451,11 @@ Agent Pipeline Options (--mode agent):
   --max-refine-iterations N    Max self-refine iterations (default: 2)
   --max-debug-iterations N     Max auto-debug iterations (default: 3)
 
+Advanced Features (v3.1):
+  --code-rag                   Enable CodeRAG: mine GitHub for reference implementations
+  --no-segmentation            Disable automatic document segmentation
+  --no-context-manager         Disable context manager (use legacy rolling-window)
+
 Cache:
   --no-cache                   Disable caching
   --cache-dir DIR              Custom cache directory
@@ -405,23 +482,26 @@ Misc:
 
 ---
 
-## Comparison with PaperCoder
+## Comparison with PaperCoder & DeepCode
 
-| Feature | Research2Repo v3.0 | PaperCoder |
-|---------|-------------------|------------|
-| Multi-model support | Gemini, OpenAI, Anthropic, Ollama | GPT-4o only |
-| Decomposed planning | 4-stage (overall/arch/logic/config) | 3-stage (overall/arch/logic) |
-| Per-file analysis | Yes | Yes |
-| Self-refine loops | All stages | Plan + code |
-| UML diagrams | Mermaid class + sequence | PlantUML class + sequence |
-| Vision/diagram extraction | Yes (multimodal) | No |
-| Equation extraction | Dedicated pipeline | No |
-| Execution sandbox | Docker + local | No |
-| Auto-debug | Yes (19+ error types) | No |
-| DevOps generation | Dockerfile, CI, Makefile | No |
-| Reference evaluation | LLM-based scoring | No |
-| Caching | Content-addressed | No |
-| Local models | Ollama support | No |
+| Feature | Research2Repo v3.1 | PaperCoder | DeepCode |
+|---------|-------------------|------------|----------|
+| Multi-model support | Gemini, OpenAI, Anthropic, Ollama | GPT-4o only | Claude, GPT, Gemini |
+| Decomposed planning | 4-stage (overall/arch/logic/config) | 3-stage (overall/arch/logic) | Requirement analysis |
+| Per-file analysis | Yes | Yes | Memory agent context |
+| Self-refine loops | All stages | Plan + code | No |
+| UML diagrams | Mermaid class + sequence | PlantUML class + sequence | No |
+| Vision/diagram extraction | Yes (multimodal) | No | No |
+| Equation extraction | Dedicated pipeline | No | No |
+| Execution sandbox | Docker + local | No | Execute + debug |
+| Auto-debug | Yes (19+ error types) | No | Yes |
+| DevOps generation | Dockerfile, CI, Makefile | No | No |
+| Reference evaluation | LLM-based scoring | No | No |
+| Caching | Content-addressed | No | No |
+| Local models | Ollama support | No | No |
+| CodeRAG (ref mining) | GitHub search + LLM indexing | No | Codebase indexing |
+| Document segmentation | 4 strategies, algorithm-preserving | No | 5 strategies |
+| Context management | Clean-slate + cumulative summaries | Rolling window | Concise memory agent |
 
 ---
 

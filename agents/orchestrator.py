@@ -38,6 +38,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "enable_tests": True,
     "enable_evaluation": False,
     "enable_devops": True,
+    "enable_code_rag": False,
+    "enable_segmentation": True,
+    "enable_context_manager": True,
     "interactive": False,
     "max_debug_iterations": 3,
     "max_refine_iterations": 2,
@@ -206,14 +209,53 @@ class AgentOrchestrator:
               f"({timings['file_analysis']})")
 
         # ==============================================================
-        # Stage 4 — Code generation
+        # Stage 3b — Document Segmentation (large papers)
+        # ==============================================================
+        segmentation_result = None
+        paper_text = getattr(analysis, "full_text", "") or (
+            document if isinstance(document, str) else ""
+        )
+        if cfg.get("enable_segmentation", True) and len(paper_text) > 40_000:
+            t0 = time.time()
+            _header("Document Segmentation", "3b")
+            segmentation_result = self._stage_segmentation(paper_text)
+            timings["segmentation"] = _elapsed(t0)
+            seg_count = len(segmentation_result.segments) if segmentation_result else 0
+            print(f"  ✓ Segmented paper into {seg_count} chunks  "
+                  f"({timings['segmentation']})")
+        else:
+            if cfg.get("enable_segmentation", True):
+                print(f"\n  [Segmenter] Paper within token limits "
+                      f"({len(paper_text):,} chars); segmentation not needed.")
+
+        # ==============================================================
+        # Stage 3c — CodeRAG (Reference Code Mining)
+        # ==============================================================
+        code_rag_index = None
+        if cfg.get("enable_code_rag", False):
+            t0 = time.time()
+            _header("CodeRAG — Reference Mining", "3c")
+            code_rag_index = self._stage_code_rag(analysis, plan, provider)
+            timings["code_rag"] = _elapsed(t0)
+            mapping_count = len(code_rag_index.mappings) if code_rag_index else 0
+            print(f"  ✓ CodeRAG: {mapping_count} file mappings  "
+                  f"({timings['code_rag']})")
+
+        # ==============================================================
+        # Stage 4 — Code generation (with ContextManager)
         # ==============================================================
         t0 = time.time()
         _header("Code Generation", 4)
 
-        generated_files = self._stage_code_generation(
-            analysis, plan, document, provider,
-        )
+        if cfg.get("enable_context_manager", True):
+            generated_files = self._stage_code_generation_managed(
+                analysis, plan, document, provider,
+                code_rag_index=code_rag_index,
+            )
+        else:
+            generated_files = self._stage_code_generation(
+                analysis, plan, document, provider,
+            )
         result["files"] = generated_files
         timings["codegen"] = _elapsed(t0)
         print(f"  ✓ Generated {len(generated_files)} files  "
@@ -625,6 +667,127 @@ class AgentOrchestrator:
                 fh.write(content)
             files_written += 1
         return files_written
+
+    # ------------------------------------------------------------------
+    # New stages: Segmentation, CodeRAG, Managed Code Generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stage_segmentation(paper_text: str) -> Any:
+        """Stage 3b — Segment large papers into manageable chunks."""
+        try:
+            from advanced.document_segmenter import DocumentSegmenter  # lazy
+        except ImportError:
+            print("  [Orchestrator] DocumentSegmenter not available — "
+                  "skipping segmentation.")
+            return None
+
+        segmenter = DocumentSegmenter()
+        return segmenter.segment(paper_text)
+
+    @staticmethod
+    def _stage_code_rag(
+        analysis: Any,
+        plan: Any,
+        provider: BaseProvider,
+    ) -> Any:
+        """Stage 3c — Build reference code index from GitHub."""
+        try:
+            from advanced.code_rag import CodeRAG  # lazy
+        except ImportError:
+            print("  [Orchestrator] CodeRAG not available — "
+                  "skipping reference mining.")
+            return None
+
+        rag = CodeRAG(provider=provider)
+        return rag.build_index(analysis=analysis, plan=plan)
+
+    @staticmethod
+    def _stage_code_generation_managed(
+        analysis: Any,
+        plan: Any,
+        document: Any,
+        provider: BaseProvider,
+        code_rag_index: Any = None,
+    ) -> dict[str, str]:
+        """Stage 4 — Code synthesis with ContextManager for clean-slate context."""
+        try:
+            from advanced.context_manager import ContextManager  # lazy
+            from advanced.code_rag import CodeRAG  # lazy
+        except ImportError:
+            # Fall back to regular code generation
+            from core.coder import CodeSynthesizer  # lazy
+            coder = CodeSynthesizer(provider=provider)
+            return coder.generate_codebase(
+                analysis=analysis, plan=plan, document=document,
+            )
+
+        from core.coder import CodeSynthesizer  # lazy
+        from providers.base import GenerationConfig
+
+        ctx_mgr = ContextManager(
+            plan=plan,
+            analysis=analysis,
+            provider=provider,
+        )
+        coder = CodeSynthesizer(provider=provider)
+
+        # Optional CodeRAG helper
+        rag = None
+        if code_rag_index is not None:
+            try:
+                rag = CodeRAG(provider=provider)
+            except Exception:
+                pass
+
+        generated: dict[str, str] = {}
+
+        for i, file_spec in enumerate(plan.files):
+            print(f"  [CodeGen] ({i+1}/{len(plan.files)}) Generating {file_spec.path}...")
+
+            # Get reference context from CodeRAG if available
+            ref_context = ""
+            if rag and code_rag_index:
+                ref_context = rag.get_reference_context(
+                    file_spec.path, code_rag_index
+                )
+
+            # Build managed context (clean-slate)
+            gen_ctx = ctx_mgr.build_context(
+                file_spec=file_spec,
+                reference_context=ref_context,
+            )
+
+            # Generate using the managed prompt
+            config = GenerationConfig(
+                temperature=0.15,
+                max_output_tokens=16384
+                if ("model" in file_spec.path or "train" in file_spec.path)
+                else 8192,
+            )
+
+            if document and hasattr(provider, "generate_with_file"):
+                result = provider.generate_with_file(
+                    uploaded_file=document,
+                    prompt=gen_ctx.full_prompt(),
+                    system_prompt=gen_ctx.system_prompt,
+                    config=config,
+                )
+            else:
+                result = provider.generate(
+                    prompt=gen_ctx.full_prompt(),
+                    system_prompt=gen_ctx.system_prompt,
+                    config=config,
+                )
+
+            code = coder._clean_output(result.text, file_spec.path)
+            generated[file_spec.path] = code
+
+            # Record in context manager for cumulative summary
+            ctx_mgr.record_file(file_spec.path, code)
+
+        print(f"  [CodeGen] Complete: {len(generated)} files with managed context.")
+        return generated
 
     # ------------------------------------------------------------------
     # Self-refine helper

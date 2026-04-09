@@ -383,6 +383,9 @@ def run_agent(
     enable_tests: bool = True,
     enable_evaluation: bool = False,
     enable_devops: bool = True,
+    enable_code_rag: bool = False,
+    enable_segmentation: bool = True,
+    enable_context_manager: bool = True,
     interactive: bool = False,
     max_fix_iterations: int = 2,
     max_refine_iterations: int = 2,
@@ -402,6 +405,9 @@ def run_agent(
       - DevOps generation (Dockerfile, Makefile, CI)
       - Reference-based evaluation scoring
       - Interactive planning review mode
+      - CodeRAG: reference code mining from GitHub (v3.1)
+      - Document segmentation for large papers (v3.1)
+      - Context manager with cumulative code summaries (v3.1)
     """
     from agents.orchestrator import AgentOrchestrator
 
@@ -433,6 +439,9 @@ def run_agent(
         "enable_tests": enable_tests,
         "enable_evaluation": enable_evaluation,
         "enable_devops": enable_devops,
+        "enable_code_rag": enable_code_rag,
+        "enable_segmentation": enable_segmentation,
+        "enable_context_manager": enable_context_manager,
         "interactive": interactive,
         "max_fix_iterations": max_fix_iterations,
         "max_refine_iterations": max_refine_iterations,
@@ -519,6 +528,13 @@ Examples:
   python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent \\
     --refine --execute --evaluate --reference-dir ./reference_impl
 
+  # Enable CodeRAG: mine GitHub for reference implementations
+  python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent --code-rag
+
+  # Agent mode with all v3.1 features
+  python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --mode agent \\
+    --code-rag --refine --execute
+
   # Use specific provider and model
   python main.py --pdf_url "https://arxiv.org/pdf/1706.03762.pdf" --provider openai --model gpt-4o
 
@@ -582,6 +598,15 @@ Examples:
     agent_group.add_argument("--max-debug-iterations", type=int, default=3,
                              help="Max auto-debug iterations (default: 3)")
 
+    # Advanced features (v3.1)
+    advanced_group = parser.add_argument_group("Advanced Features (v3.1)")
+    advanced_group.add_argument("--code-rag", action="store_true",
+                                help="Enable CodeRAG: mine GitHub for reference implementations")
+    advanced_group.add_argument("--no-segmentation", action="store_true",
+                                help="Disable automatic document segmentation for large papers")
+    advanced_group.add_argument("--no-context-manager", action="store_true",
+                                help="Disable context manager (use legacy rolling-window context)")
+
     # Cache control
     cache_group = parser.add_argument_group("Cache")
     cache_group.add_argument("--no-cache", action="store_true",
@@ -639,6 +664,9 @@ Examples:
             enable_tests=not args.no_tests,
             enable_evaluation=args.evaluate,
             enable_devops=not args.no_devops,
+            enable_code_rag=args.code_rag,
+            enable_segmentation=not args.no_segmentation,
+            enable_context_manager=not args.no_context_manager,
             interactive=args.interactive,
             max_fix_iterations=args.max_fix_iterations,
             max_refine_iterations=args.max_refine_iterations,
