@@ -1,6 +1,6 @@
 # Gateway Integration & Dual-Mode Architecture
 
-Research2Repo supports two deployment modes: a **standalone CLI** for individual use and a **gateway-managed engine** for platform-scale operation behind [Any2Repo-Gateway](https://github.com/nellaivijay/Any2Repo-Gateway). This page documents the dual-mode architecture, the gateway adapter protocol, environment variable contracts, deployment patterns, and worked examples for both modes.
+Research2Repo supports two deployment modes: a **standalone CLI** for individual use and a **gateway-managed engine** for platform-scale operation behind [Any2Repo-Gateway](https://github.com/nellaivijay/Any2Repo-Gateway). This page documents the dual-mode architecture, the gateway adapter protocol, environment variable contracts, **cloud-agnostic artifact upload**, **HMAC-signed webhook delivery**, deployment patterns, and worked examples for both modes.
 
 ---
 
@@ -67,8 +67,9 @@ main.py
   |     |       +-- Resolve input (PDF URL, base64, or raw text)
   |     |       +-- Call run_classic() or run_agent()
   |     |       +-- Count generated files
-  |     |       +-- Write .any2repo_status.json
-  |     |       +-- POST to CALLBACK_URL (best-effort)
+  |     |       +-- Upload artifact to cloud storage (GCS/S3/Azure/local)
+  |     |       +-- Write .any2repo_status.json (incl. artifact_url)
+  |     |       +-- POST webhook with HMAC signature (or legacy callback)
   |     |       +-- sys.exit(0 or 1)
   |     |
   |     No --> Standard CLI
@@ -113,7 +114,7 @@ The key insight: Layer 0 and Layer 1 are **mutually exclusive**. When `JOB_ID` i
 
 ## 3. gateway_adapter.py Deep Dive
 
-The gateway adapter module (`gateway_adapter.py` at the repository root) implements four public functions. It has zero dependencies on `core/`, `advanced/`, or `agents/` — it only imports from `main.py` at runtime when it needs to call `run_classic()` or `run_agent()`.
+The gateway adapter module (`gateway_adapter.py` at the repository root) implements public functions and a cloud-agnostic artifact storage abstraction. It has zero dependencies on `core/`, `advanced/`, or `agents/` — it only imports from `main.py` at runtime when it needs to call `run_classic()` or `run_agent()`.
 
 ### 3.1 `is_gateway_mode() -> bool`
 
@@ -177,7 +178,57 @@ Key design decisions:
 - **30-second timeout.** Prevents the engine from hanging indefinitely if the gateway is slow.
 - **Lazy import of `requests`.** The `requests` library is imported inside the function body to avoid adding a hard dependency for CLI-only users.
 
-### 3.4 `run_gateway_mode() -> None`
+### 3.4 Cloud-Agnostic Artifact Storage
+
+The adapter includes a pluggable artifact storage system with four backends:
+
+| Class | Backend | URI Format | Pre-signed URL |
+|-------|---------|------------|----------------|
+| `GCSArtifactStore` | Google Cloud Storage | `gs://bucket/key` | GCS v4 signed URL |
+| `S3ArtifactStore` | Amazon S3 | `s3://bucket/key` | S3 pre-signed URL |
+| `AzureBlobArtifactStore` | Azure Blob Storage | `https://account.blob.../container/key` | Azure SAS URL |
+| `LocalArtifactStore` | Local filesystem | `file:///path` | `file://` path |
+
+All backends implement `BaseArtifactStore` with two methods:
+- `upload(local_path, remote_key) -> str` — upload and return URI
+- `presigned_url(remote_key, ttl_seconds) -> str` — generate download URL
+
+The `create_artifact_store()` factory selects the backend from the `ARTIFACT_BACKEND` env var, with auto-detection from `GCS_ARTIFACT_BUCKET`, `AWS_REGION`, `AZURE_STORAGE_ACCOUNT_URL`, or `LOCAL_ARTIFACT_DIR`.
+
+### 3.5 `upload_artifact(output_dir, job_id) -> tuple[str, int]`
+
+Orchestrates the artifact upload flow:
+
+1. Creates the artifact store via `create_artifact_store()`
+2. Zips `OUTPUT_DIR` into `{OUTPUT_DIR}_artifact.zip`
+3. Uploads to `jobs/{JOB_ID}/output.zip`
+4. Generates a pre-signed download URL (TTL from `PRESIGNED_URL_TTL`)
+5. Returns `(presigned_url, size_bytes)`
+
+Falls back gracefully — returns `("", 0)` if no store is configured or upload fails.
+
+### 3.6 `post_webhook(webhook_url, payload, secret) -> bool`
+
+HMAC-signed webhook POST to the gateway. Preferred over the legacy `post_callback()`.
+
+```python
+def post_webhook(webhook_url: str, payload: dict, secret: str = "") -> bool:
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        headers["X-Webhook-Signature"] = sig
+    resp = requests.post(webhook_url, data=body, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return True
+```
+
+Key differences from `post_callback()`:
+- **HMAC signature** — when `WEBHOOK_SECRET` is set, the payload is signed with SHA-256
+- **Gateway webhook endpoint** — POSTs to `/api/v1/webhooks/engine-complete`
+- **Same best-effort semantics** — never raises, returns `False` on failure
+
+### 3.7 `run_gateway_mode() -> None`
 
 The main orchestration function for gateway mode. It:
 
@@ -213,6 +264,14 @@ The gateway injects these environment variables when launching the R2R engine co
 | `CALLBACK_URL` | No | `""` | URL to POST job results on completion. |
 | `R2R_PROVIDER` | No | auto-detect | Override LLM provider (`gemini`, `openai`, `anthropic`, `ollama`). |
 | `R2R_MODEL` | No | provider default | Override model name (e.g., `gpt-4o`, `gemini-2.5-pro-preview-05-06`). |
+| `WEBHOOK_URL` | No | `""` | Gateway webhook endpoint URL (preferred over `CALLBACK_URL`). |
+| `WEBHOOK_SECRET` | No | `""` | HMAC-SHA256 secret for signing webhook payloads. |
+| `ARTIFACT_BACKEND` | No | auto-detect | Storage backend for artifact upload: `gcs`, `s3`, `azure`, `local`. |
+| `ARTIFACT_BUCKET` | No | `""` | Bucket/container name for cloud artifact backends. |
+| `GCS_ARTIFACT_BUCKET` | No | `""` | Legacy alias for `ARTIFACT_BUCKET` (GCS-only deploys). |
+| `PRESIGNED_URL_TTL` | No | `"900"` | Pre-signed URL lifetime in seconds. |
+| `LOCAL_ARTIFACT_DIR` | No | `""` | Base directory for local filesystem artifacts. |
+| `AZURE_STORAGE_ACCOUNT_URL` | No | `""` | Azure storage account URL (for Azure backend). |
 
 ### Input Priority
 
@@ -376,6 +435,8 @@ The `.any2repo_status.json` file is written to `OUTPUT_DIR` on every gateway-mod
 | `elapsed_seconds` | `float` | Wall-clock execution time |
 | `completed_at` | `string` | ISO 8601 UTC timestamp |
 | `metadata` | `object` | Engine-specific metadata (tenant, mode, provider) |
+| `artifact_url` | `string` | Pre-signed download URL for the zipped artifact |
+| `artifact_size_bytes` | `int` | Size of the zip artifact in bytes |
 
 ### Example: Successful Run
 
@@ -388,11 +449,14 @@ The `.any2repo_status.json` file is written to `OUTPUT_DIR` on every gateway-mod
   "error": "",
   "files_generated": 14,
   "elapsed_seconds": 187.34,
+  "artifact_url": "https://storage.googleapis.com/my-bucket/jobs/job-20250715-abc123/output.zip?X-Goog-Signature=...",
+  "artifact_size_bytes": 2457600,
   "completed_at": "2025-07-15T10:23:45.678901+00:00",
   "metadata": {
     "tenant_id": "acme-corp",
     "mode": "agent",
-    "provider": "gemini"
+    "provider": "gemini",
+    "model": "gemini-2.5-pro"
   }
 }
 ```
@@ -794,27 +858,32 @@ curl -X POST http://gateway:8000/api/v1/engines \
 The gateway and R2R communicate exclusively through environment variables (input) and two output channels (status file + callback POST). There is no persistent connection, no gRPC stream, and no shared memory. This design makes the integration simple, debuggable, and compatible with any container runtime.
 
 ```
-+------------------+          +------------------+
-|  Any2Repo-       |          |  Research2Repo   |
-|  Gateway         |          |  Engine          |
-+--------+---------+          +--------+---------+
-         |                             |
-         |  ENV VARS (input)           |
-         |---------------------------->|
-         |                             |
-         |                             |  (pipeline runs)
-         |                             |
-         |  CALLBACK POST (output)     |
-         |<----------------------------|
-         |                             |
-         |  STATUS FILE (output)       |
-         |  (read from shared volume   |
-         |   or container filesystem)  |
-         |<----------------------------|
-         |                             |
-         |  EXIT CODE (signal)         |
-         |<----------------------------|
-+--------+---------+          +--------+---------+
++------------------+          +------------------+         +------------------+
+|  Any2Repo-       |          |  Research2Repo   |         |  Cloud Storage   |
+|  Gateway         |          |  Engine          |         |  (GCS/S3/Azure)  |
++--------+---------+          +--------+---------+         +--------+---------+
+         |                             |                            |
+         |  ENV VARS (input)           |                            |
+         |---------------------------->|                            |
+         |                             |                            |
+         |                             |  (pipeline runs)           |
+         |                             |                            |
+         |                             |  ARTIFACT UPLOAD           |
+         |                             |--------------------------->|
+         |                             |                            |
+         |                             |  PRE-SIGNED URL            |
+         |                             |<---------------------------|
+         |                             |                            |
+         |  WEBHOOK POST (HMAC signed) |                            |
+         |  (includes artifact_url)    |                            |
+         |<----------------------------|                            |
+         |                             |                            |
+         |  STATUS FILE (output)       |                            |
+         |<----------------------------|                            |
+         |                             |                            |
+         |  EXIT CODE (signal)         |                            |
+         |<----------------------------|                            |
++--------+---------+          +--------+---------+         +--------+---------+
 ```
 
 ### Multi-Engine Architecture

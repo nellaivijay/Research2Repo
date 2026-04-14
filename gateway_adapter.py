@@ -2,18 +2,27 @@
 
 When the ``JOB_ID`` environment variable is set, the engine runs in
 **gateway mode**: it reads job parameters from env vars, executes the
-pipeline, uploads the output artifact to GCS, and POSTs a signed
-webhook callback to the gateway.
+pipeline, uploads the output artifact to cloud storage, and POSTs a
+signed webhook callback to the gateway.
 
 When ``JOB_ID`` is *not* set, the engine behaves exactly as before —
 a standalone CLI tool driven by ``argparse``.
 
 This module implements the Any2Repo Engine Protocol v1.0.
 See: https://github.com/nellaivijay/Any2Repo-Gateway/blob/main/docs/engine_protocol.md
+
+**Cloud-agnostic:** Supports GCS, S3, Azure Blob Storage, and local
+filesystem for artifact delivery.  The storage backend is selected via
+the ``ARTIFACT_BACKEND`` environment variable.
+
+**Multi-model:** Provider and model overrides are forwarded from the
+gateway's ``ENGINE_OPTIONS`` or dedicated env vars (``R2R_PROVIDER``,
+``R2R_MODEL``) to the pipeline.
 """
 
 from __future__ import annotations
 
+import abc
 import hashlib
 import hmac
 import json
@@ -22,7 +31,7 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -98,7 +107,206 @@ def write_status_file(
     return status_path
 
 
-# ── GCS Artifact Upload ─────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# Cloud-Agnostic Artifact Storage
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class BaseArtifactStore(abc.ABC):
+    """Abstract interface for uploading artifacts and generating download URLs."""
+
+    @abc.abstractmethod
+    def upload(self, local_path: str, remote_key: str) -> str:
+        """Upload a file and return its remote URI (gs://, s3://, etc.)."""
+
+    @abc.abstractmethod
+    def presigned_url(self, remote_key: str, ttl_seconds: int = 900) -> str:
+        """Generate a time-limited download URL."""
+
+
+class GCSArtifactStore(BaseArtifactStore):
+    """Google Cloud Storage artifact store."""
+
+    def __init__(self, bucket: str) -> None:
+        self._bucket_name = bucket
+
+    def upload(self, local_path: str, remote_key: str) -> str:
+        from google.cloud import storage
+        client = storage.Client()
+        bucket = client.bucket(self._bucket_name)
+        blob = bucket.blob(remote_key)
+        blob.upload_from_filename(local_path)
+        uri = f"gs://{self._bucket_name}/{remote_key}"
+        logger.info("Uploaded artifact to %s", uri)
+        return uri
+
+    def presigned_url(self, remote_key: str, ttl_seconds: int = 900) -> str:
+        from google.cloud import storage
+        client = storage.Client()
+        blob = client.bucket(self._bucket_name).blob(remote_key)
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=ttl_seconds),
+            method="GET",
+        )
+        logger.info("Generated GCS pre-signed URL (ttl=%ds)", ttl_seconds)
+        return url
+
+
+class S3ArtifactStore(BaseArtifactStore):
+    """AWS S3 artifact store."""
+
+    def __init__(self, bucket: str, region: str = "") -> None:
+        self._bucket_name = bucket
+        self._region = region or os.environ.get("AWS_REGION", "us-east-1")
+
+    def _client(self):
+        import boto3
+        return boto3.client("s3", region_name=self._region)
+
+    def upload(self, local_path: str, remote_key: str) -> str:
+        self._client().upload_file(local_path, self._bucket_name, remote_key)
+        uri = f"s3://{self._bucket_name}/{remote_key}"
+        logger.info("Uploaded artifact to %s", uri)
+        return uri
+
+    def presigned_url(self, remote_key: str, ttl_seconds: int = 900) -> str:
+        url = self._client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._bucket_name, "Key": remote_key},
+            ExpiresIn=ttl_seconds,
+        )
+        logger.info("Generated S3 pre-signed URL (ttl=%ds)", ttl_seconds)
+        return url
+
+
+class AzureBlobArtifactStore(BaseArtifactStore):
+    """Azure Blob Storage artifact store."""
+
+    def __init__(self, container: str, account_url: str = "") -> None:
+        self._container_name = container
+        self._account_url = account_url or os.environ.get(
+            "AZURE_STORAGE_ACCOUNT_URL", ""
+        )
+
+    def _container_client(self):
+        from azure.storage.blob import ContainerClient
+        from azure.identity import DefaultAzureCredential
+        return ContainerClient(
+            self._account_url,
+            self._container_name,
+            credential=DefaultAzureCredential(),
+        )
+
+    def upload(self, local_path: str, remote_key: str) -> str:
+        container = self._container_client()
+        with open(local_path, "rb") as f:
+            container.upload_blob(name=remote_key, data=f, overwrite=True)
+        uri = f"https://{self._account_url}/{self._container_name}/{remote_key}"
+        logger.info("Uploaded artifact to Azure Blob: %s", uri)
+        return uri
+
+    def presigned_url(self, remote_key: str, ttl_seconds: int = 900) -> str:
+        from azure.storage.blob import BlobSasPermissions, generate_blob_sas
+        from azure.identity import DefaultAzureCredential
+        # Extract account name from URL
+        account_name = self._account_url.split("//")[1].split(".")[0] if "//" in self._account_url else ""
+        sas = generate_blob_sas(
+            account_name=account_name,
+            container_name=self._container_name,
+            blob_name=remote_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+        )
+        url = f"{self._account_url}/{self._container_name}/{remote_key}?{sas}"
+        logger.info("Generated Azure SAS URL (ttl=%ds)", ttl_seconds)
+        return url
+
+
+class LocalArtifactStore(BaseArtifactStore):
+    """Local filesystem artifact store for on-prem / dev use.
+
+    Copies the artifact to a shared directory and returns a file:// URL.
+    """
+
+    def __init__(self, base_dir: str = "") -> None:
+        self._base_dir = base_dir or os.environ.get(
+            "LOCAL_ARTIFACT_DIR", "/tmp/any2repo-artifacts"
+        )
+
+    def upload(self, local_path: str, remote_key: str) -> str:
+        dest = os.path.join(self._base_dir, remote_key)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(local_path, dest)
+        logger.info("Copied artifact to %s", dest)
+        return f"file://{dest}"
+
+    def presigned_url(self, remote_key: str, ttl_seconds: int = 900) -> str:
+        # Local store doesn't need signed URLs — return the file path
+        path = os.path.join(self._base_dir, remote_key)
+        return f"file://{path}"
+
+
+def create_artifact_store() -> Optional[BaseArtifactStore]:
+    """Factory: create the appropriate artifact store from env vars.
+
+    Environment variables:
+        ARTIFACT_BACKEND        — "gcs", "s3", "azure", "local" (auto-detected if not set)
+        ARTIFACT_BUCKET         — Bucket / container name (required for cloud backends)
+        GCS_ARTIFACT_BUCKET     — Legacy alias for ARTIFACT_BUCKET (GCS)
+        AWS_REGION              — AWS region for S3
+        AZURE_STORAGE_ACCOUNT_URL — Azure storage account URL
+        LOCAL_ARTIFACT_DIR      — Base directory for local artifacts
+
+    Returns None if no artifact storage is configured.
+    """
+    backend = os.environ.get("ARTIFACT_BACKEND", "").lower()
+    bucket = os.environ.get("ARTIFACT_BUCKET", "") or os.environ.get("GCS_ARTIFACT_BUCKET", "")
+
+    # Auto-detect backend from bucket name pattern
+    if not backend and bucket:
+        if os.environ.get("GCS_ARTIFACT_BUCKET"):
+            backend = "gcs"
+        elif os.environ.get("AWS_REGION") or bucket.startswith("s3://"):
+            backend = "s3"
+        elif os.environ.get("AZURE_STORAGE_ACCOUNT_URL"):
+            backend = "azure"
+        else:
+            backend = "gcs"  # default cloud backend
+
+    if not backend:
+        # Check for local artifact directory
+        if os.environ.get("LOCAL_ARTIFACT_DIR"):
+            backend = "local"
+        else:
+            return None
+
+    if backend == "gcs":
+        if not bucket:
+            logger.warning("ARTIFACT_BUCKET not set for GCS backend — skipping")
+            return None
+        return GCSArtifactStore(bucket)
+    elif backend == "s3":
+        if not bucket:
+            logger.warning("ARTIFACT_BUCKET not set for S3 backend — skipping")
+            return None
+        return S3ArtifactStore(bucket, region=os.environ.get("AWS_REGION", ""))
+    elif backend == "azure":
+        if not bucket:
+            logger.warning("ARTIFACT_BUCKET not set for Azure backend — skipping")
+            return None
+        return AzureBlobArtifactStore(
+            container=bucket,
+            account_url=os.environ.get("AZURE_STORAGE_ACCOUNT_URL", ""),
+        )
+    elif backend == "local":
+        return LocalArtifactStore()
+    else:
+        logger.warning("Unknown ARTIFACT_BACKEND '%s' — skipping artifact upload", backend)
+        return None
+
+
+# ── Artifact upload orchestrator ─────────────────────────────────────────
 
 
 def zip_output(output_dir: str) -> str:
@@ -108,86 +316,35 @@ def zip_output(output_dir: str) -> str:
     """
     archive_base = output_dir.rstrip("/") + "_artifact"
     archive_path = shutil.make_archive(archive_base, "zip", output_dir)
-    logger.info("Zipped output: %s (%.2f MB)", archive_path, os.path.getsize(archive_path) / 1_048_576)
+    logger.info(
+        "Zipped output: %s (%.2f MB)",
+        archive_path,
+        os.path.getsize(archive_path) / 1_048_576,
+    )
     return archive_path
 
 
-def upload_to_gcs(
-    local_path: str,
-    bucket_name: str,
-    blob_name: str,
-) -> str:
-    """Upload a file to GCS and return the blob's gs:// URI.
-
-    Uses Application Default Credentials (Workload Identity on GKE).
-    """
-    from google.cloud import storage
-
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(local_path)
-    gs_uri = f"gs://{bucket_name}/{blob_name}"
-    logger.info("Uploaded artifact to %s", gs_uri)
-    return gs_uri
-
-
-def generate_presigned_url(
-    bucket_name: str,
-    blob_name: str,
-    ttl_seconds: int = 900,
-) -> str:
-    """Generate a time-limited signed URL for a GCS object.
-
-    Args:
-        bucket_name: GCS bucket name.
-        blob_name: Path within the bucket.
-        ttl_seconds: URL validity in seconds (default 15 minutes).
-
-    Returns:
-        HTTPS pre-signed URL for direct download.
-    """
-    from datetime import timedelta
-
-    from google.cloud import storage
-
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-
-    url = blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(seconds=ttl_seconds),
-        method="GET",
-    )
-    logger.info("Generated pre-signed URL (ttl=%ds) for %s/%s", ttl_seconds, bucket_name, blob_name)
-    return url
-
-
 def upload_artifact(output_dir: str, job_id: str) -> tuple[str, int]:
-    """Zip output, upload to GCS, return (presigned_url, size_bytes).
+    """Zip output, upload to cloud storage, return (presigned_url, size_bytes).
 
-    Environment variables:
-        GCS_ARTIFACT_BUCKET — target bucket (required)
-        PRESIGNED_URL_TTL   — URL lifetime in seconds (default 900)
-
-    Falls back gracefully if GCS is unavailable — returns empty string
+    Uses the ``ARTIFACT_BACKEND`` env var to select the storage backend.
+    Falls back gracefully if storage is unavailable — returns empty string
     and zero size, allowing the status file to still be written.
     """
-    bucket = os.environ.get("GCS_ARTIFACT_BUCKET", "")
     ttl = int(os.environ.get("PRESIGNED_URL_TTL", "900"))
+    store = create_artifact_store()
 
-    if not bucket:
-        logger.warning("GCS_ARTIFACT_BUCKET not set — skipping artifact upload")
+    if store is None:
+        logger.warning("No artifact store configured — skipping artifact upload")
         return "", 0
 
     try:
         zip_path = zip_output(output_dir)
         size_bytes = os.path.getsize(zip_path)
-        blob_name = f"jobs/{job_id}/output.zip"
+        remote_key = f"jobs/{job_id}/output.zip"
 
-        upload_to_gcs(zip_path, bucket, blob_name)
-        presigned = generate_presigned_url(bucket, blob_name, ttl_seconds=ttl)
+        store.upload(zip_path, remote_key)
+        presigned = store.presigned_url(remote_key, ttl_seconds=ttl)
 
         # Clean up local zip
         os.remove(zip_path)
@@ -271,15 +428,19 @@ def run_gateway_mode() -> None:
         CALLBACK_URL        — Legacy: URL to POST results to on completion
         WEBHOOK_URL         — New: Gateway webhook endpoint URL
         WEBHOOK_SECRET      — HMAC secret for signing webhook payloads
-        GCS_ARTIFACT_BUCKET — GCS bucket for artifact upload
+        ARTIFACT_BACKEND    — Storage backend: "gcs", "s3", "azure", "local"
+        ARTIFACT_BUCKET     — Bucket/container name for artifact upload
+        GCS_ARTIFACT_BUCKET — Legacy alias for ARTIFACT_BUCKET (GCS)
         PRESIGNED_URL_TTL   — Pre-signed URL lifetime in seconds
+        LOCAL_ARTIFACT_DIR  — Base directory for local artifact storage
+        AZURE_STORAGE_ACCOUNT_URL — Azure storage account URL
         R2R_PROVIDER        — LLM provider override
         R2R_MODEL           — Model name override
 
     The function:
     1. Parses env vars into pipeline arguments
     2. Runs the appropriate pipeline (classic or agent)
-    3. Zips and uploads the output to GCS (if configured)
+    3. Zips and uploads the output to cloud storage (if configured)
     4. Writes ``.any2repo_status.json``
     5. POSTs a signed webhook to the gateway (or legacy callback)
     6. Exits with code 0 (success) or 1 (failure)
@@ -364,7 +525,7 @@ def run_gateway_mode() -> None:
         elapsed = time.time() - start_time
         logger.info("Pipeline completed: %d files in %.1fs", files_generated, elapsed)
 
-        # Upload artifact to GCS and generate pre-signed URL
+        # Upload artifact to cloud storage and generate pre-signed URL
         artifact_url, artifact_size = upload_artifact(output_dir, job_id)
 
         status_path = write_status_file(
@@ -379,6 +540,7 @@ def run_gateway_mode() -> None:
                 "tenant_id": tenant_id,
                 "mode": mode,
                 "provider": provider_name or "auto",
+                "model": model_name or "default",
             },
         )
 
@@ -408,6 +570,7 @@ def run_gateway_mode() -> None:
                 "tenant_id": tenant_id,
                 "mode": mode,
                 "provider": provider_name or "auto",
+                "model": model_name or "default",
             },
         )
 

@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Vijay Anand", email = "nellaivijay@gmail.com"},
+    {name = "Vijay Anand"},
 ]
 keywords = ["machine-learning", "code-generation", "research", "llm", "agentic", "papercoder"]
 classifiers = [

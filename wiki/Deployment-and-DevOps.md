@@ -160,7 +160,7 @@ You can containerize Research2Repo itself for reproducible runs. This is useful 
 ```dockerfile
 FROM python:3.10-slim
 
-LABEL maintainer="Vijayakumar Ramdoss <nellaivijay@gmail.com>"
+LABEL maintainer="Vijayakumar Ramdoss"
 LABEL description="Research2Repo v3.0 - ML Paper to Repository Pipeline"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
