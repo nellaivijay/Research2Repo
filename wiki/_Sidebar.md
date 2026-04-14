@@ -22,6 +22,7 @@
 ### Operations
 
 - [API Reference](API-Reference)
+- [Gateway Integration](Gateway-Integration)
 - [Deployment & DevOps](Deployment-and-DevOps)
 - [Troubleshooting & FAQ](Troubleshooting-and-FAQ)
 - [PaperCoder Issues Analysis](PaperCoder-Issues-Analysis)

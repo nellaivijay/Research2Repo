@@ -13,6 +13,7 @@ This document covers local development setup, Docker deployment, the DevOps file
 - [5. Execution Sandbox Architecture](#5-execution-sandbox-architecture)
 - [6. Scaling Considerations](#6-scaling-considerations)
 - [7. Monitoring and Observability](#7-monitoring-and-observability)
+- [8. Gateway-Managed Deployment](#8-gateway-managed-deployment)
 
 ---
 
@@ -159,7 +160,7 @@ You can containerize Research2Repo itself for reproducible runs. This is useful 
 ```dockerfile
 FROM python:3.10-slim
 
-LABEL maintainer="Research2Repo"
+LABEL maintainer="Vijayakumar Ramdoss <nellaivijay@gmail.com>"
 LABEL description="Research2Repo v3.0 - ML Paper to Repository Pipeline"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -942,3 +943,116 @@ print(f'Model: {info.name}')
 print(f'Context: {info.max_context_tokens} tokens')
 "
 ```
+
+---
+
+## 8. Gateway-Managed Deployment
+
+Research2Repo can be deployed as a **managed engine** behind the [Any2Repo-Gateway](https://github.com/nellaivijay/Any2Repo-Gateway), which handles multi-tenant authentication, backend routing, and job lifecycle management across GCP Vertex AI, AWS Bedrock, Azure ML, and on-premise infrastructure.
+
+For full details, see the [Gateway Integration](Gateway-Integration) wiki page.
+
+### How It Works
+
+In gateway mode, the gateway launches the R2R container with environment variables. The `gateway_adapter.py` module detects `JOB_ID` and runs the pipeline automatically:
+
+```
+Gateway                          R2R Container
+  |                                    |
+  |  docker run -e JOB_ID=abc123       |
+  |  -e PDF_URL=https://arxiv.org/...  |
+  |  -e ENGINE_OPTIONS='{"mode":...}'  |
+  |  any2repo/research2repo:latest     |
+  |----------------------------------->|
+  |                                    |
+  |                           main.py starts
+  |                           is_gateway_mode() = True
+  |                           run_gateway_mode()
+  |                              |
+  |                              v
+  |                           Run pipeline
+  |                           (classic or agent)
+  |                              |
+  |                              v
+  |                           Write .any2repo_status.json
+  |                           POST to CALLBACK_URL
+  |                           exit 0
+  |                                    |
+  |  Poll job status                   |
+  |  GET /api/v1/jobs/abc123           |
+  |<-----------------------------------|
+```
+
+### Building the Gateway-Compatible Docker Image
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENTRYPOINT ["python", "main.py"]
+```
+
+```bash
+docker build -t any2repo/research2repo:latest .
+docker push any2repo/research2repo:latest
+```
+
+### Testing Gateway Mode Locally
+
+You can test gateway mode without a running gateway by setting the environment variables directly:
+
+```bash
+JOB_ID=local-test-001 \
+  PDF_URL="https://arxiv.org/pdf/1706.03762.pdf" \
+  OUTPUT_DIR=/tmp/r2r-test \
+  ENGINE_OPTIONS='{"mode":"agent","refine":true}' \
+  GEMINI_API_KEY="your-key" \
+  python main.py
+```
+
+Check the status file after completion:
+
+```bash
+cat /tmp/r2r-test/.any2repo_status.json
+```
+
+### Gateway Configuration for R2R
+
+To register Research2Repo with the gateway, ensure the engine manifest is available. The built-in manifest is registered automatically. For custom deployments, place a manifest in `ENGINE_MANIFESTS_DIR`:
+
+```json
+{
+  "engine_id": "research2repo",
+  "version": "2.0.0",
+  "display_name": "Research2Repo",
+  "description": "Convert ML/AI research papers into fully functional repositories",
+  "protocol_version": "1.0",
+  "capabilities": ["pdf_input", "text_input", "github_output", "local_output"],
+  "accepted_inputs": ["pdf_url", "pdf_base64", "paper_text"],
+  "container_image": "any2repo/research2repo:latest",
+  "supported_backends": ["gcp_vertex", "aws_bedrock", "azure_ml", "on_prem"],
+  "cpu_request": "4",
+  "memory_request": "16Gi",
+  "timeout_seconds": 3600
+}
+```
+
+### Supported Cloud Backends
+
+| Backend | How R2R Is Launched | Status Tracking |
+|---|---|---|
+| **GCP Vertex AI** | Custom Job (container) | Vertex AI job status API |
+| **AWS Bedrock** | Invoke model | Bedrock response |
+| **Azure ML** | ML pipeline job | Azure ML job status |
+| **On-Prem (Docker)** | `docker run -d` with env vars | `docker inspect` exit code |
+| **On-Prem (HTTP)** | POST to running engine service | GET status endpoint |

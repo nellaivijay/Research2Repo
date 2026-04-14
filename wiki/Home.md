@@ -28,6 +28,7 @@ Version 3.0 | Inspired by [PaperCoder](https://arxiv.org/abs/2504.17192) | Apach
 | Document | Description |
 |----------|-------------|
 | [API Reference](API-Reference) | Programmatic usage, class interfaces, method signatures |
+| [Gateway Integration](Gateway-Integration) | Dual-mode architecture, Any2Repo-Gateway protocol, worked examples |
 | [Deployment & DevOps](Deployment-and-DevOps) | Docker, CI/CD, production considerations |
 | [Troubleshooting & FAQ](Troubleshooting-and-FAQ) | Common issues, debugging tips, FAQ |
 
