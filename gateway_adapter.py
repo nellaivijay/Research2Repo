@@ -2,8 +2,8 @@
 
 When the ``JOB_ID`` environment variable is set, the engine runs in
 **gateway mode**: it reads job parameters from env vars, executes the
-pipeline, writes a ``.any2repo_status.json`` status file, and optionally
-POSTs results to a callback URL.
+pipeline, uploads the output artifact to GCS, and POSTs a signed
+webhook callback to the gateway.
 
 When ``JOB_ID`` is *not* set, the engine behaves exactly as before —
 a standalone CLI tool driven by ``argparse``.
@@ -14,9 +14,12 @@ See: https://github.com/nellaivijay/Any2Repo-Gateway/blob/main/docs/engine_proto
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -50,6 +53,8 @@ def write_status_file(
     error: str = "",
     files_generated: int = 0,
     elapsed_seconds: float = 0.0,
+    artifact_url: str = "",
+    artifact_size_bytes: int = 0,
     metadata: Optional[dict] = None,
 ) -> str:
     """Write ``.any2repo_status.json`` per the Engine Protocol spec.
@@ -62,6 +67,8 @@ def write_status_file(
         error: Error message (required when status is ``"failed"``).
         files_generated: Number of files produced.
         elapsed_seconds: Wall-clock execution time.
+        artifact_url: Pre-signed URL to the zipped output artifact.
+        artifact_size_bytes: Size of the zip artifact in bytes.
         metadata: Additional engine-specific metadata.
 
     Returns:
@@ -78,6 +85,8 @@ def write_status_file(
         "error": error,
         "files_generated": files_generated,
         "elapsed_seconds": round(elapsed_seconds, 2),
+        "artifact_url": artifact_url,
+        "artifact_size_bytes": artifact_size_bytes,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "metadata": metadata or {},
     }
@@ -87,6 +96,109 @@ def write_status_file(
 
     logger.info("Wrote status file: %s (status=%s)", status_path, status)
     return status_path
+
+
+# ── GCS Artifact Upload ─────────────────────────────────────────────────
+
+
+def zip_output(output_dir: str) -> str:
+    """Zip the output directory into a .zip archive.
+
+    Returns the path to the zip file.
+    """
+    archive_base = output_dir.rstrip("/") + "_artifact"
+    archive_path = shutil.make_archive(archive_base, "zip", output_dir)
+    logger.info("Zipped output: %s (%.2f MB)", archive_path, os.path.getsize(archive_path) / 1_048_576)
+    return archive_path
+
+
+def upload_to_gcs(
+    local_path: str,
+    bucket_name: str,
+    blob_name: str,
+) -> str:
+    """Upload a file to GCS and return the blob's gs:// URI.
+
+    Uses Application Default Credentials (Workload Identity on GKE).
+    """
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    gs_uri = f"gs://{bucket_name}/{blob_name}"
+    logger.info("Uploaded artifact to %s", gs_uri)
+    return gs_uri
+
+
+def generate_presigned_url(
+    bucket_name: str,
+    blob_name: str,
+    ttl_seconds: int = 900,
+) -> str:
+    """Generate a time-limited signed URL for a GCS object.
+
+    Args:
+        bucket_name: GCS bucket name.
+        blob_name: Path within the bucket.
+        ttl_seconds: URL validity in seconds (default 15 minutes).
+
+    Returns:
+        HTTPS pre-signed URL for direct download.
+    """
+    from datetime import timedelta
+
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=ttl_seconds),
+        method="GET",
+    )
+    logger.info("Generated pre-signed URL (ttl=%ds) for %s/%s", ttl_seconds, bucket_name, blob_name)
+    return url
+
+
+def upload_artifact(output_dir: str, job_id: str) -> tuple[str, int]:
+    """Zip output, upload to GCS, return (presigned_url, size_bytes).
+
+    Environment variables:
+        GCS_ARTIFACT_BUCKET — target bucket (required)
+        PRESIGNED_URL_TTL   — URL lifetime in seconds (default 900)
+
+    Falls back gracefully if GCS is unavailable — returns empty string
+    and zero size, allowing the status file to still be written.
+    """
+    bucket = os.environ.get("GCS_ARTIFACT_BUCKET", "")
+    ttl = int(os.environ.get("PRESIGNED_URL_TTL", "900"))
+
+    if not bucket:
+        logger.warning("GCS_ARTIFACT_BUCKET not set — skipping artifact upload")
+        return "", 0
+
+    try:
+        zip_path = zip_output(output_dir)
+        size_bytes = os.path.getsize(zip_path)
+        blob_name = f"jobs/{job_id}/output.zip"
+
+        upload_to_gcs(zip_path, bucket, blob_name)
+        presigned = generate_presigned_url(bucket, blob_name, ttl_seconds=ttl)
+
+        # Clean up local zip
+        os.remove(zip_path)
+
+        return presigned, size_bytes
+    except Exception as exc:
+        logger.error("Artifact upload failed: %s", exc, exc_info=True)
+        return "", 0
+
+
+# ── Webhook callback ─────────────────────────────────────────────────────
 
 
 def post_callback(callback_url: str, payload: dict) -> bool:
@@ -107,6 +219,41 @@ def post_callback(callback_url: str, payload: dict) -> bool:
         return False
 
 
+def post_webhook(webhook_url: str, payload: dict, secret: str = "") -> bool:
+    """POST to the gateway webhook endpoint with optional HMAC signature.
+
+    Args:
+        webhook_url: Full URL (e.g. https://gateway/api/v1/webhooks/engine-complete).
+        payload: The EngineWebhookPayload-shaped dict.
+        secret: HMAC-SHA256 secret for signing. Empty = unsigned.
+
+    Returns True on success, False on failure (never raises).
+    """
+    if not webhook_url:
+        return False
+
+    try:
+        import requests
+
+        body = json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+
+        if secret:
+            sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+            headers["X-Webhook-Signature"] = sig
+
+        resp = requests.post(webhook_url, data=body, headers=headers, timeout=30)
+        resp.raise_for_status()
+        logger.info(
+            "Webhook POST to %s succeeded (HTTP %d, signed=%s)",
+            webhook_url, resp.status_code, bool(secret),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Webhook POST to %s failed: %s", webhook_url, exc)
+        return False
+
+
 # ── Gateway entry point ──────────────────────────────────────────────────
 
 
@@ -114,23 +261,28 @@ def run_gateway_mode() -> None:
     """Execute Research2Repo in gateway mode.
 
     Reads all parameters from environment variables:
-        JOB_ID          — Unique job identifier (required)
-        TENANT_ID       — Tenant who submitted the job
-        PDF_URL         — URL of the research paper
-        PDF_BASE64      — Base64-encoded PDF (alternative)
-        PAPER_TEXT       — Raw paper text (alternative)
-        OUTPUT_DIR      — Where to write generated files (default: /tmp/r2r-{JOB_ID})
-        ENGINE_OPTIONS  — JSON string of additional options
-        CALLBACK_URL    — URL to POST results to on completion
-        R2R_PROVIDER    — LLM provider override
-        R2R_MODEL       — Model name override
+        JOB_ID              — Unique job identifier (required)
+        TENANT_ID           — Tenant who submitted the job
+        PDF_URL             — URL of the research paper
+        PDF_BASE64          — Base64-encoded PDF (alternative)
+        PAPER_TEXT          — Raw paper text (alternative)
+        OUTPUT_DIR          — Where to write generated files (default: /tmp/r2r-{JOB_ID})
+        ENGINE_OPTIONS      — JSON string of additional options
+        CALLBACK_URL        — Legacy: URL to POST results to on completion
+        WEBHOOK_URL         — New: Gateway webhook endpoint URL
+        WEBHOOK_SECRET      — HMAC secret for signing webhook payloads
+        GCS_ARTIFACT_BUCKET — GCS bucket for artifact upload
+        PRESIGNED_URL_TTL   — Pre-signed URL lifetime in seconds
+        R2R_PROVIDER        — LLM provider override
+        R2R_MODEL           — Model name override
 
     The function:
     1. Parses env vars into pipeline arguments
     2. Runs the appropriate pipeline (classic or agent)
-    3. Writes ``.any2repo_status.json``
-    4. POSTs to ``CALLBACK_URL`` if set
-    5. Exits with code 0 (success) or 1 (failure)
+    3. Zips and uploads the output to GCS (if configured)
+    4. Writes ``.any2repo_status.json``
+    5. POSTs a signed webhook to the gateway (or legacy callback)
+    6. Exits with code 0 (success) or 1 (failure)
     """
     job_id = os.environ.get("JOB_ID", "")
     tenant_id = os.environ.get("TENANT_ID", "")
@@ -139,6 +291,8 @@ def run_gateway_mode() -> None:
     paper_text = os.environ.get("PAPER_TEXT", "")
     output_dir = os.environ.get("OUTPUT_DIR", f"/tmp/r2r-{job_id}")
     callback_url = os.environ.get("CALLBACK_URL", "")
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
     options_json = os.environ.get("ENGINE_OPTIONS", "{}")
 
     logger.info(
@@ -210,12 +364,17 @@ def run_gateway_mode() -> None:
         elapsed = time.time() - start_time
         logger.info("Pipeline completed: %d files in %.1fs", files_generated, elapsed)
 
+        # Upload artifact to GCS and generate pre-signed URL
+        artifact_url, artifact_size = upload_artifact(output_dir, job_id)
+
         status_path = write_status_file(
             output_dir=output_dir,
             job_id=job_id,
             status="completed",
             files_generated=files_generated,
             elapsed_seconds=elapsed,
+            artifact_url=artifact_url,
+            artifact_size_bytes=artifact_size,
             metadata={
                 "tenant_id": tenant_id,
                 "mode": mode,
@@ -223,8 +382,11 @@ def run_gateway_mode() -> None:
             },
         )
 
-        # Callback
-        if callback_url:
+        # Notify gateway via webhook (preferred) or legacy callback
+        if webhook_url:
+            with open(status_path) as f:
+                post_webhook(webhook_url, json.load(f), secret=webhook_secret)
+        elif callback_url:
             with open(status_path) as f:
                 post_callback(callback_url, json.load(f))
 
@@ -249,7 +411,11 @@ def run_gateway_mode() -> None:
             },
         )
 
-        if callback_url:
+        # Notify gateway even on failure
+        if webhook_url:
+            with open(status_path) as f:
+                post_webhook(webhook_url, json.load(f), secret=webhook_secret)
+        elif callback_url:
             with open(status_path) as f:
                 post_callback(callback_url, json.load(f))
 
